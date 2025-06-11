@@ -1,0 +1,32 @@
+# Neo4j Configuration for Papers with Code Loader
+# Copy this file and modify with your actual credentials
+
+local:
+  uri: "bolt://localhost:7687"
+  user: "neo4j"
+  password: "password"  # Change this to your local Neo4j password
+  description: "Local development Neo4j instance"
+
+remote:
+  uri: "bolt://remote-server:7687"  # Change to your remote server
+  user: "neo4j"
+  password: "remote_password"  # Change this to your remote Neo4j password
+  description: "Remote production Neo4j instance"
+
+# Example additional configurations:
+# staging:
+#   uri: "bolt://staging.example.com:7687"
+#   user: "neo4j"
+#   password: "staging_password"
+#   description: "Staging environment"
+#
+# production:
+#   uri: "bolt://prod.example.com:7687"
+#   user: "neo4j_prod"
+#   password: "secure_production_password"
+#   description: "Production environment"
+
+# Security Note: 
+# - Never commit this file with real passwords to version control
+# - Consider using environment variables for sensitive credentials
+# - Use strong passwords for production environments

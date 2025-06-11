@@ -34,10 +34,14 @@ except ImportError:
                 yield item
                 
         def set_postfix(self, **kwargs):
-            # For nested progress bars, show completion info
-            if not self.leave and kwargs:
+            # Show postfix info for all progress bars
+            if kwargs:
                 info = ", ".join([f"{k}={v}" for k, v in kwargs.items()])
-                print(f"    {self.desc}: {info}")
+                if self.total:
+                    progress_pct = ((self.current + 1) / self.total * 100) if self.total > 0 else 0
+                    print(f"{self.desc}: {self.current + 1}/{self.total} ({progress_pct:.1f}%) - {info}")
+                else:
+                    print(f"{self.desc}: {self.current + 1} - {info}")
             
         def close(self):
             if self.leave and self.total:
@@ -648,39 +652,18 @@ class PapersWithCodeOfflineLoader:
                     end_idx = min(start_idx + batch_size, len(datasets))
                     batch = datasets[start_idx:end_idx]
                     
+                    # Process dataset batch directly
+                    result = graph.batch_save_datasets(batch, batch_size)
+                    total_saved += result["saved"]
+                    total_failed += result["failed"]
+                    
+                    # Update progress bar with results
                     dataset_progress.set_postfix({
                         "batch": f"{batch_idx+1}/{total_batches}",
                         "items": f"{start_idx}-{end_idx-1}",
                         "saved": total_saved,
                         "failed": total_failed
                     })
-                    
-                    # Process dataset batch with nested progress bar
-                    batch_progress = tqdm(
-                        range(1), 
-                        desc=f"  Saving dataset batch {batch_idx+1}", 
-                        unit="batch",
-                        leave=False,
-                        mininterval=0.1
-                    )
-                    
-                    for _ in batch_progress:
-                        batch_progress.set_postfix({
-                            "datasets": f"{len(batch)}",
-                            "processing": "..."
-                        })
-                        
-                        result = graph.batch_save_datasets(batch, batch_size)
-                        total_saved += result["saved"]
-                        total_failed += result["failed"]
-                        
-                        batch_progress.set_postfix({
-                            "datasets": f"{len(batch)}",
-                            "saved": result["saved"],
-                            "failed": result["failed"]
-                        })
-                    
-                    batch_progress.close()
                 
                 dataset_progress.close()
                 logger.info(f"📊 Dataset batch saving summary: {total_saved} saved, {total_failed} failed")
@@ -703,7 +686,7 @@ class PapersWithCodeOfflineLoader:
             batch_size = 100  # Larger batches for papers
             total_batches = (len(papers) + batch_size - 1) // batch_size
             
-            # Enhanced progress bar for batch processing
+            # Single progress bar for batch processing
             paper_progress = tqdm(
                 range(total_batches),
                 desc="Saving paper batches", 
@@ -720,7 +703,12 @@ class PapersWithCodeOfflineLoader:
                 end_idx = min(start_idx + batch_size, len(papers))
                 batch = papers[start_idx:end_idx]
                 
-                # Calculate current rates
+                # Process batch directly
+                result = graph.batch_save_papers(batch, batch_size)
+                total_saved += result["saved"]
+                total_failed += result["failed"]
+                
+                # Calculate current rates for display
                 elapsed = time.time() - phase2_start if batch_idx > 0 else 1
                 current_papers_processed = min(end_idx, len(papers))
                 rate = current_papers_processed / elapsed
@@ -739,33 +727,6 @@ class PapersWithCodeOfflineLoader:
                     "rate": f"{rate:.1f}/s",
                     "ETA": f"{eta_hours:.1f}h"
                 })
-                
-                # Process batch with nested progress bar
-                batch_progress = tqdm(
-                    range(1), 
-                    desc=f"  Saving batch {batch_idx+1}", 
-                    unit="batch",
-                    leave=False,  # Don't leave the nested progress bar
-                    mininterval=0.1
-                )
-                
-                for _ in batch_progress:
-                    batch_progress.set_postfix({
-                        "papers": f"{len(batch)}",
-                        "processing": "..."
-                    })
-                    
-                    result = graph.batch_save_papers(batch, batch_size)
-                    total_saved += result["saved"]
-                    total_failed += result["failed"]
-                    
-                    batch_progress.set_postfix({
-                        "papers": f"{len(batch)}",
-                        "saved": result["saved"], 
-                        "failed": result["failed"]
-                    })
-                
-                batch_progress.close()
                 
                 # Detailed logging every 10 batches for very large datasets
                 if (batch_idx + 1) % 10 == 0:
@@ -872,6 +833,7 @@ def confirm_dangerous_operation(operation_type: str, target_description: str) ->
 def main():
     """Main function to run offline data loading pipeline"""
     import argparse
+    from config_parser import Neo4jConfig
     
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -974,6 +936,21 @@ def main():
         action="store_true",
         help="⚠️  DANGER: Drop ALL data from target Neo4j database (requires confirmation, use with --new-neo4j-uri)"
     )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to configuration file (default: config.yaml)"
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Use local environment from config file"
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Use remote environment from config file as target"
+    )
     
     args = parser.parse_args()
     
@@ -996,6 +973,52 @@ def main():
         logger.error("❌ --drop-all-target requires --new-neo4j-uri")
         logger.error("   You must specify a target database to drop all data from")
         return
+    
+    # Validate config-related arguments
+    if args.local and args.remote and not (args.new_neo4j_uri or args.clear_target or args.drop_all_target):
+        logger.error("❌ When using both --local and --remote, you must specify one of:")
+        logger.error("   --new-neo4j-uri (use remote as target)")
+        logger.error("   --clear-target (clear remote target)")
+        logger.error("   --drop-all-target (drop all data from remote target)")
+        return
+    
+    # Load configuration
+    config = None
+    local_config = None
+    remote_config = None
+    
+    if args.local or args.remote:
+        config = Neo4jConfig(args.config)
+        
+        if args.local:
+            local_config = config.get_local_config()
+            if not local_config:
+                logger.error("❌ Failed to load local configuration")
+                logger.error(f"   Check your config file: {args.config}")
+                return
+        
+        if args.remote:
+            remote_config = config.get_remote_config()
+            if not remote_config:
+                logger.error("❌ Failed to load remote configuration")
+                logger.error(f"   Check your config file: {args.config}")
+                return
+    
+    # Override Neo4j settings with config values
+    if local_config:
+        logger.info("🔧 Using local config for primary Neo4j connection")
+        args.neo4j_uri = local_config['uri']
+        args.neo4j_user = local_config['user']
+        args.neo4j_password = local_config['password']
+    
+    if remote_config and not args.new_neo4j_uri:
+        logger.info("🔧 Using remote config for target Neo4j connection")
+        args.new_neo4j_uri = remote_config['uri']
+        args.new_neo4j_user = remote_config['user']
+        args.new_neo4j_password = remote_config['password']
+    elif remote_config and args.new_neo4j_uri:
+        logger.warning("⚠️  Both --remote config and --new-neo4j-uri specified")
+        logger.warning("   Using explicit --new-neo4j-uri settings, ignoring remote config")
     
     # Determine data directory
     if args.data_dir:
@@ -1025,6 +1048,9 @@ def main():
         for dataset_key, available in summary['files_available'].items():
             status = "✅" if available else "❌"
             logger.info(f"   {status} {dataset_key}")
+        
+        # Initialize graph variable
+        graph = None
         
         # Check if we're loading to a new Neo4j instance
         if args.new_neo4j_uri:
@@ -1081,18 +1107,19 @@ def main():
         
         logger.info("Pipeline completed successfully!")
         
-        # Example queries
-        logger.info("\n--- Example Queries ---")
-        
-        # Get graph statistics
-        final_stats = graph.get_graph_stats()
-        logger.info(f"Final Graph Statistics: {final_stats}")
+        # Example queries (only for local graph)
+        if graph:
+            logger.info("\n--- Example Queries ---")
+            
+            # Get graph statistics
+            final_stats = graph.get_graph_stats()
+            logger.info(f"Final Graph Statistics: {final_stats}")
         
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
     finally:
         # Clean up
-        if 'graph' in locals():
+        if 'graph' in locals() and graph is not None:
             graph.close()
 
 if __name__ == "__main__":

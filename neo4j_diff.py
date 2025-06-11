@@ -395,6 +395,7 @@ class Neo4jDiff:
 def main():
     """Main function to run Neo4j diff comparison"""
     import argparse
+    from config_parser import Neo4jConfig
     
     parser = argparse.ArgumentParser(
         description="Compare data between two Neo4j instances"
@@ -444,8 +445,64 @@ def main():
         action="store_true",
         help="Only compare Papers with Code specific data types (useful for mixed databases)"
     )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to configuration file (default: config.yaml)"
+    )
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="Use local environment from config file as source"
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Use remote environment from config file as target"
+    )
     
     args = parser.parse_args()
+    
+    # Load configuration if using config flags
+    config = None
+    local_config = None
+    remote_config = None
+    
+    if args.local or args.remote:
+        config = Neo4jConfig(args.config)
+        
+        if args.local:
+            local_config = config.get_local_config()
+            if not local_config:
+                logger.error("❌ Failed to load local configuration")
+                logger.error(f"   Check your config file: {args.config}")
+                return
+        
+        if args.remote:
+            remote_config = config.get_remote_config()
+            if not remote_config:
+                logger.error("❌ Failed to load remote configuration")
+                logger.error(f"   Check your config file: {args.config}")
+                return
+    
+    # Determine source and target URIs and credentials
+    if local_config:
+        args.source_uri = local_config['uri']
+        args.source_user = local_config['user']
+        args.source_password = local_config['password']
+        logger.info("🔧 Using local config for source connection")
+    
+    if remote_config:
+        args.target_uri = remote_config['uri']
+        args.target_user = remote_config['user']
+        args.target_password = remote_config['password']
+        logger.info("🔧 Using remote config for target connection")
+    
+    # Validate that we have both source and target
+    if not args.target_uri:
+        logger.error("❌ Target URI is required")
+        logger.error("   Use --target-uri or --remote with config file")
+        return
     
     try:
         # Initialize diff tool

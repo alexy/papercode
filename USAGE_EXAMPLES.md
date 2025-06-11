@@ -1,5 +1,37 @@
 # Usage Examples for Updated Offline Loader
 
+## 🔧 Configuration File Support
+
+The loader now supports YAML configuration files for storing Neo4j credentials:
+
+```bash
+# Create example config file
+cp config.yaml my-config.yaml
+# Edit my-config.yaml with your credentials
+
+# Use config file
+python pwc_offline_loader.py pwc-20250610 --local --paper-limit 1000
+python pwc_offline_loader.py pwc-20250610 --local --remote --clear-target
+```
+
+**See [CONFIG_USAGE.md](CONFIG_USAGE.md) for detailed configuration guide.**
+
+### Quick Config Examples
+
+```bash
+# Load to local instance from config
+python pwc_offline_loader.py pwc-20250610 --local --paper-limit 1000
+
+# Load from local to remote (both from config)
+python pwc_offline_loader.py pwc-20250610 --local --remote --clear-target --paper-limit 5000
+
+# Compare local vs remote using config
+python neo4j_diff.py --local --remote --pwc-only
+
+# Use custom config file
+python pwc_offline_loader.py pwc-20250610 --config my-config.yaml --local
+```
+
 ## Loading Data to a New Neo4j Instance
 
 ### Basic Usage
