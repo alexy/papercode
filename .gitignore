@@ -3,3 +3,4 @@
 *.gz
 venv
 pwc-20*
+config.yaml
