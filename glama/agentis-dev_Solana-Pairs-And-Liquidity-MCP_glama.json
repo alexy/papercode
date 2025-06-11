@@ -1,0 +1,54 @@
+{
+  "name": "solana-pairs-liquidity-mcp",
+  "description": "MCP Server for real-time Solana blockchain liquidity and token pairs data. Provides access to trading pairs, liquidity pools, and DeFi analytics across major Solana DEXes including Raydium, Orca, and Jupiter.",
+  "author": "Solana MCP Community",
+  "license": "MIT",
+  "version": "1.0.0",
+  "keywords": [
+    "solana",
+    "defi",
+    "liquidity",
+    "pairs",
+    "trading",
+    "raydium",
+    "orca",
+    "jupiter",
+    "blockchain",
+    "real-time"
+  ],
+  "homepage": "https://github.com/your-org/solana-pairs-liquidity-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/solana-pairs-liquidity-mcp.git"
+  },
+  "capabilities": {
+    "tools": [
+      {
+        "name": "get_solana_pairs",
+        "description": "Get real-time Solana trading pairs data from various DEXes"
+      },
+      {
+        "name": "get_pool_liquidity", 
+        "description": "Get detailed liquidity information for a specific Solana pool"
+      },
+      {
+        "name": "find_token_pair",
+        "description": "Find trading pairs for specific tokens on Solana"
+      },
+      {
+        "name": "get_pool_stats",
+        "description": "Get comprehensive statistics and analysis for a Solana liquidity pool"
+      }
+    ]
+  },
+  "config": {
+    "environment_variables": [
+      {
+        "name": "SOLANA_RPC_URL",
+        "description": "Solana RPC endpoint URL",
+        "required": false,
+        "default": "https://api.mainnet-beta.solana.com"
+      }
+    ]
+  }
+} 
