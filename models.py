@@ -75,6 +75,23 @@ class Dataset(BaseModel, Neo4jMixin):
             return None
         return v
     
+    @validator('name', pre=True)
+    def validate_name(cls, v):
+        """Ensure name is never None or empty"""
+        if not v:
+            return "Unknown Dataset"
+        return str(v).strip()
+    
+    @validator('paper_count', pre=True)
+    def validate_paper_count(cls, v):
+        """Ensure paper_count is always a valid integer"""
+        if v is None or v == "":
+            return 0
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return 0
+    
     def save_to_neo4j(self) -> bool:
         """Save dataset to Neo4j"""
         try:
@@ -201,6 +218,30 @@ class Repository(BaseModel, Neo4jMixin):
     def validate_framework(cls, v):
         return cls.parse_framework(v)
     
+    @validator('stars', pre=True)
+    def validate_stars(cls, v):
+        """Ensure stars is always a valid integer"""
+        if v is None or v == "":
+            return 0
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return 0
+    
+    @validator('name', pre=True)
+    def validate_name(cls, v):
+        """Ensure name is never None"""
+        if not v:
+            return "unknown"
+        return str(v)
+    
+    @validator('owner', pre=True) 
+    def validate_owner(cls, v):
+        """Ensure owner is never None"""
+        if not v:
+            return "unknown"
+        return str(v)
+    
     def save_to_neo4j(self) -> bool:
         """Save repository to Neo4j"""
         try:
@@ -261,12 +302,37 @@ class Paper(BaseModel, Neo4jMixin):
     id: str
     arxiv_id: Optional[str] = None
     url_abs: Optional[HttpUrl] = None
-    title: str
+    title: Optional[str] = "Untitled Paper"  # Allow None, provide default
     abstract: Optional[str] = None
     authors: List[Author] = []
     published: Optional[datetime] = None
     venue: Optional[str] = None
     citation_count: Optional[int] = 0
+    
+    @validator('title', pre=True)
+    def validate_title(cls, v):
+        """Ensure title is never None or empty"""
+        if v is None or v == "":
+            return "Untitled Paper"
+        return str(v).strip()
+    
+    @validator('citation_count', pre=True)
+    def validate_citation_count(cls, v):
+        """Ensure citation_count is always a valid integer"""
+        if v is None or v == "":
+            return 0
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return 0
+    
+    @validator('id', pre=True)
+    def validate_id(cls, v):
+        """Ensure id is never None or empty"""
+        if not v:
+            import uuid
+            return str(uuid.uuid4())
+        return str(v)
     
     # Relationships
     repositories: List[Repository] = []
@@ -514,6 +580,292 @@ class PapersWithCodeGraph:
     def close(self):
         """Close all Neo4j connections"""
         Paper.close_connection()
+    
+    def batch_save_papers(self, papers: List, batch_size: int = 100) -> Dict[str, int]:
+        """Save papers in batches for better performance"""
+        if not papers:
+            return {"saved": 0, "failed": 0}
+        
+        saved_count = 0
+        failed_count = 0
+        
+        try:
+            session = Paper.get_session()
+            
+            # Process papers in batches
+            for i in range(0, len(papers), batch_size):
+                batch = papers[i:i + batch_size]
+                
+                try:
+                    # Prepare batch data
+                    papers_data = []
+                    authors_data = []
+                    repositories_data = []
+                    paper_repo_links = []
+                    
+                    for paper in batch:
+                        # Prepare paper data
+                        paper_dict = paper.dict(exclude={'authors', 'repositories', 'datasets', 'tasks'})
+                        if paper_dict.get('published'):
+                            paper_dict['published'] = paper_dict['published'].isoformat()
+                        if paper_dict.get('url_abs'):
+                            paper_dict['url_abs'] = str(paper_dict['url_abs'])
+                        papers_data.append(paper_dict)
+                        
+                        # Prepare authors data
+                        for author in paper.authors:
+                            authors_data.append({
+                                'paper_id': paper.id,
+                                'name': author.name,
+                                'email': author.email,
+                                'affiliation': author.affiliation
+                            })
+                        
+                        # Prepare repositories data
+                        for repo in paper.repositories:
+                            repo_dict = repo.dict()
+                            if repo_dict.get('url'):
+                                repo_dict['url'] = str(repo_dict['url'])
+                            if repo_dict.get('framework'):
+                                repo_dict['framework'] = repo_dict['framework'].value if hasattr(repo_dict['framework'], 'value') else str(repo_dict['framework'])
+                            if repo_dict.get('created_at'):
+                                repo_dict['created_at'] = repo_dict['created_at'].isoformat()
+                            repositories_data.append(repo_dict)
+                            
+                            paper_repo_links.append({
+                                'paper_id': paper.id,
+                                'repo_url': str(repo.url)
+                            })
+                    
+                    # Batch insert papers
+                    if papers_data:
+                        paper_batch_query = """
+                        UNWIND $papers AS paper_data
+                        MERGE (p:Paper {id: paper_data.id})
+                        SET p.arxiv_id = paper_data.arxiv_id,
+                            p.url_abs = paper_data.url_abs,
+                            p.title = paper_data.title,
+                            p.abstract = paper_data.abstract,
+                            p.published = paper_data.published,
+                            p.venue = paper_data.venue,
+                            p.citation_count = paper_data.citation_count,
+                            p.updated_at = datetime()
+                        """
+                        session.run(paper_batch_query, papers=papers_data)
+                    
+                    # Batch insert authors and relationships
+                    if authors_data:
+                        author_batch_query = """
+                        UNWIND $authors AS author_data
+                        MERGE (a:Author {name: author_data.name})
+                        SET a.email = author_data.email,
+                            a.affiliation = author_data.affiliation
+                        WITH a, author_data
+                        MATCH (p:Paper {id: author_data.paper_id})
+                        MERGE (a)-[:AUTHORED]->(p)
+                        """
+                        session.run(author_batch_query, authors=authors_data)
+                    
+                    # Batch insert repositories
+                    if repositories_data:
+                        repo_batch_query = """
+                        UNWIND $repositories AS repo_data
+                        MERGE (r:Repository {url: repo_data.url})
+                        SET r.owner = repo_data.owner,
+                            r.name = repo_data.name,
+                            r.description = repo_data.description,
+                            r.stars = repo_data.stars,
+                            r.framework = repo_data.framework,
+                            r.language = repo_data.language,
+                            r.license = repo_data.license,
+                            r.created_at = repo_data.created_at,
+                            r.updated_at = datetime()
+                        """
+                        session.run(repo_batch_query, repositories=repositories_data)
+                    
+                    # Batch create paper-repository relationships
+                    if paper_repo_links:
+                        link_batch_query = """
+                        UNWIND $links AS link_data
+                        MATCH (p:Paper {id: link_data.paper_id})
+                        MATCH (r:Repository {url: link_data.repo_url})
+                        MERGE (p)-[:HAS_CODE]->(r)
+                        """
+                        session.run(link_batch_query, links=paper_repo_links)
+                    
+                    saved_count += len(batch)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to save batch starting at index {i}: {e}")
+                    failed_count += len(batch)
+                    continue
+            
+            return {"saved": saved_count, "failed": failed_count}
+            
+        except Exception as e:
+            logger.error(f"Batch save failed: {e}")
+            return {"saved": saved_count, "failed": len(papers) - saved_count}
+    
+    def batch_save_datasets(self, datasets: List, batch_size: int = 50) -> Dict[str, int]:
+        """Save datasets in batches for better performance"""
+        if not datasets:
+            return {"saved": 0, "failed": 0}
+        
+        saved_count = 0
+        failed_count = 0
+        
+        try:
+            session = Dataset.get_session()
+            
+            # Process datasets in batches
+            for i in range(0, len(datasets), batch_size):
+                batch = datasets[i:i + batch_size]
+                
+                try:
+                    datasets_data = [dataset.dict() for dataset in batch]
+                    
+                    batch_query = """
+                    UNWIND $datasets AS dataset_data
+                    MERGE (d:Dataset {id: dataset_data.id})
+                    SET d.name = dataset_data.name,
+                        d.full_name = dataset_data.full_name,
+                        d.url = dataset_data.url,
+                        d.description = dataset_data.description,
+                        d.paper_count = dataset_data.paper_count,
+                        d.updated_at = datetime()
+                    """
+                    session.run(batch_query, datasets=datasets_data)
+                    saved_count += len(batch)
+                    
+                except Exception as e:
+                    logger.error(f"Failed to save dataset batch starting at index {i}: {e}")
+                    failed_count += len(batch)
+                    continue
+            
+            return {"saved": saved_count, "failed": failed_count}
+            
+        except Exception as e:
+            logger.error(f"Dataset batch save failed: {e}")
+            return {"saved": saved_count, "failed": len(datasets) - saved_count}
+    
+    def clear_all_data(self) -> Dict[str, int]:
+        """Clear all data from Neo4j database"""
+        try:
+            session = Paper.get_session()
+            
+            # Count existing data before deletion
+            existing_data = self.check_existing_data()
+            
+            logger.info("🗑️  Clearing all existing data from Neo4j...")
+            
+            # Delete all relationships first (to avoid constraint issues)
+            delete_queries = [
+                "MATCH ()-[r]->() DELETE r",  # Delete all relationships
+                "MATCH (n) DELETE n"         # Delete all nodes
+            ]
+            
+            for query in delete_queries:
+                session.run(query)
+            
+            logger.info(f"✅ Cleared: {existing_data}")
+            return existing_data
+            
+        except Exception as e:
+            logger.error(f"Failed to clear data: {e}")
+            return {'papers': 0, 'datasets': 0, 'repositories': 0, 'authors': 0}
+    
+    def clear_papers_only(self) -> int:
+        """Clear only papers and their relationships"""
+        try:
+            session = Paper.get_session()
+            
+            # Count existing papers
+            result = session.run("MATCH (p:Paper) RETURN count(p) as count")
+            record = result.single()
+            paper_count = record['count'] if record else 0
+            
+            if paper_count > 0:
+                logger.info(f"🗑️  Clearing {paper_count} existing papers from Neo4j...")
+                
+                # Delete paper relationships and papers
+                delete_queries = [
+                    "MATCH (p:Paper)-[r]-() DELETE r",  # Delete paper relationships
+                    "MATCH (p:Paper) DELETE p"          # Delete paper nodes
+                ]
+                
+                for query in delete_queries:
+                    session.run(query)
+                
+                logger.info(f"✅ Cleared {paper_count} papers")
+            
+            return paper_count
+            
+        except Exception as e:
+            logger.error(f"Failed to clear papers: {e}")
+            return 0
+    
+    def clear_datasets_only(self) -> int:
+        """Clear only datasets and their relationships"""
+        try:
+            session = Dataset.get_session()
+            
+            # Count existing datasets
+            result = session.run("MATCH (d:Dataset) RETURN count(d) as count")
+            record = result.single()
+            dataset_count = record['count'] if record else 0
+            
+            if dataset_count > 0:
+                logger.info(f"🗑️  Clearing {dataset_count} existing datasets from Neo4j...")
+                
+                # Delete dataset relationships and datasets
+                delete_queries = [
+                    "MATCH (d:Dataset)-[r]-() DELETE r",  # Delete dataset relationships
+                    "MATCH (d:Dataset) DELETE d"          # Delete dataset nodes
+                ]
+                
+                for query in delete_queries:
+                    session.run(query)
+                
+                logger.info(f"✅ Cleared {dataset_count} datasets")
+            
+            return dataset_count
+            
+        except Exception as e:
+            logger.error(f"Failed to clear datasets: {e}")
+            return 0
+    
+    def check_existing_data(self) -> Dict[str, int]:
+        """Check what data already exists in Neo4j"""
+        try:
+            session = Paper.get_session()
+            
+            counts = {}
+            
+            # Check papers
+            result = session.run("MATCH (p:Paper) RETURN count(p) as count")
+            record = result.single()
+            counts['papers'] = record['count'] if record else 0
+            
+            # Check datasets  
+            result = session.run("MATCH (d:Dataset) RETURN count(d) as count")
+            record = result.single()
+            counts['datasets'] = record['count'] if record else 0
+            
+            # Check repositories
+            result = session.run("MATCH (r:Repository) RETURN count(r) as count")
+            record = result.single()
+            counts['repositories'] = record['count'] if record else 0
+            
+            # Check authors
+            result = session.run("MATCH (a:Author) RETURN count(a) as count")
+            record = result.single()
+            counts['authors'] = record['count'] if record else 0
+            
+            return counts
+            
+        except Exception as e:
+            logger.error(f"Failed to check existing data: {e}")
+            return {'papers': 0, 'datasets': 0, 'repositories': 0, 'authors': 0}
     
     def get_graph_stats(self) -> Dict[str, int]:
         """Get statistics about the knowledge graph"""

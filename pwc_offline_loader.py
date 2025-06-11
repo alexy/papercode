@@ -5,6 +5,43 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Optional, Set
 from datetime import datetime
+import time
+
+# Optional tqdm import with fallback
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+    # Simple fallback for tqdm
+    class tqdm:
+        def __init__(self, iterable, desc="Processing", unit="item", leave=True, **kwargs):
+            self.iterable = iterable
+            self.desc = desc
+            self.leave = leave
+            self.total = len(iterable) if hasattr(iterable, '__len__') else None
+            self.current = 0
+            
+        def __iter__(self):
+            for i, item in enumerate(self.iterable):
+                self.current = i
+                # Only print for main progress bars (leave=True) to avoid spam
+                if self.leave and (i % 10 == 0 or i == 0):
+                    if self.total:
+                        print(f"{self.desc}: {i+1}/{self.total} ({(i+1)/self.total*100:.1f}%)")
+                    else:
+                        print(f"{self.desc}: {i+1} items processed")
+                yield item
+                
+        def set_postfix(self, **kwargs):
+            # For nested progress bars, show completion info
+            if not self.leave and kwargs:
+                info = ", ".join([f"{k}={v}" for k, v in kwargs.items()])
+                print(f"    {self.desc}: {info}")
+            
+        def close(self):
+            if self.leave and self.total:
+                print(f"{self.desc}: Completed {self.total}/{self.total} (100.0%)")
 from models import (
     Paper, Repository, Dataset, Task, Author, PapersWithCodeGraph, Framework
 )
@@ -40,10 +77,22 @@ class PapersWithCodeOfflineLoader:
             'datasets_processed': 0,
             'methods_processed': 0,
             'links_processed': 0,
-            'errors': 0
+            'errors': 0,
+            'start_time': None,
+            'end_time': None,
+            'duration_seconds': 0
         }
         
         logger.info(f"📁 Using offline data from: {self.data_dir}")
+    
+    def clear_cache(self):
+        """Clear all cached data to force reload"""
+        self._papers_cache = None
+        self._links_cache = None
+        self._datasets_cache = None
+        self._methods_cache = None
+        self._evaluations_cache = None
+        logger.info("🗑️ Cleared data cache")
     
     def load_papers(self, limit: Optional[int] = None) -> List[Dict]:
         """Load papers from JSON file"""
@@ -130,29 +179,46 @@ class PapersWithCodeOfflineLoader:
                 except:
                     pass
             
+            # Safely get title with fallback
+            title = paper_data.get('title')
+            if not title:  # Handle None, empty string, etc.
+                title = "Untitled Paper"
+            
             # Use arxiv_id as the primary identifier if available, otherwise fallback to other IDs
             paper_id = (paper_data.get('arxiv_id') or 
                        paper_data.get('id') or 
                        paper_data.get('paper_id') or 
-                       str(hash(paper_data.get('title', ''))))
+                       str(hash(str(title))))
             
-            # Create paper object
+            # Skip papers with completely missing critical data
+            if not paper_id or paper_id == str(hash("")):
+                logger.debug(f"Skipping paper with missing ID and title")
+                return None
+            
+            # Safely handle other fields
+            url_abs = paper_data.get('url_abs') or paper_data.get('url')
+            
+            # Create paper object with safe defaults
             paper = Paper(
                 id=str(paper_id),
                 arxiv_id=paper_data.get('arxiv_id'),
-                url_abs=paper_data.get('url_abs') or paper_data.get('url'),
-                title=paper_data.get('title', ''),
+                url_abs=url_abs,
+                title=title,
                 abstract=paper_data.get('abstract'),
                 authors=authors,
                 published=published,
                 venue=paper_data.get('proceeding') or paper_data.get('venue'),
-                citation_count=paper_data.get('citation_count', 0)
+                citation_count=paper_data.get('citation_count', 0) if paper_data.get('citation_count') is not None else 0
             )
             
             return paper
             
         except Exception as e:
-            logger.error(f"Error parsing paper: {e}")
+            # Log more detailed error information for debugging
+            paper_title = paper_data.get('title', 'Unknown')
+            paper_id = paper_data.get('id', 'Unknown')
+            logger.error(f"Error parsing paper '{paper_title}' (ID: {paper_id}): {e}")
+            logger.debug(f"Paper data causing error: {paper_data}")
             self.stats['errors'] += 1
             return None
     
@@ -181,7 +247,7 @@ class PapersWithCodeOfflineLoader:
                     framework = Framework(framework_str.lower())
                 except ValueError:
                     # Use the validator to parse framework
-                    framework = Repository.__fields__['framework'].type_.parse_framework(None, framework_str)
+                    framework = Repository.parse_framework(framework_str)
             
             repository = Repository(
                 url=url,
@@ -197,7 +263,9 @@ class PapersWithCodeOfflineLoader:
             return repository
             
         except Exception as e:
-            logger.error(f"Error parsing repository: {e}")
+            repo_url = repo_data.get('url', 'Unknown')
+            logger.error(f"Error parsing repository '{repo_url}': {e}")
+            logger.debug(f"Repository data causing error: {repo_data}")
             self.stats['errors'] += 1
             return None
     
@@ -216,7 +284,9 @@ class PapersWithCodeOfflineLoader:
             return dataset
             
         except Exception as e:
-            logger.error(f"Error parsing dataset: {e}")
+            dataset_name = dataset_data.get('name', 'Unknown')
+            logger.error(f"Error parsing dataset '{dataset_name}': {e}")
+            logger.debug(f"Dataset data causing error: {dataset_data}")
             self.stats['errors'] += 1
             return None
     
@@ -284,8 +354,10 @@ class PapersWithCodeOfflineLoader:
         if include_repositories:
             repo_mapping = self.build_paper_repository_mapping()
         
-        # Process papers
-        for paper_data in papers_data:
+        # Process papers with progress bar
+        logger.info(f"🔄 Processing {len(papers_data)} papers...")
+        paper_build_progress = tqdm(papers_data, desc="Building papers", unit="paper")
+        for paper_data in paper_build_progress:
             paper = self.parse_paper(paper_data)
             if paper:
                 # Add repositories from mapping
@@ -294,7 +366,12 @@ class PapersWithCodeOfflineLoader:
                 
                 papers.append(paper)
                 self.stats['papers_processed'] += 1
+                
+                # Update progress bar with current paper title
+                if paper.title:
+                    paper_build_progress.set_postfix({"current": paper.title[:30]})
         
+        paper_build_progress.close()
         logger.info(f"✅ Built {len(papers)} papers from offline data")
         return papers
     
@@ -308,11 +385,19 @@ class PapersWithCodeOfflineLoader:
         datasets = []
         datasets_data = self.load_datasets_json(actual_limit)
         
-        for dataset_data in datasets_data:
-            dataset = self.parse_dataset(dataset_data)
-            if dataset:
-                datasets.append(dataset)
-                self.stats['datasets_processed'] += 1
+        # Process datasets with progress bar
+        if datasets_data:
+            logger.info(f"🔄 Processing {len(datasets_data)} datasets...")
+            dataset_build_progress = tqdm(datasets_data, desc="Building datasets", unit="dataset")
+            for dataset_data in dataset_build_progress:
+                dataset = self.parse_dataset(dataset_data)
+                if dataset:
+                    datasets.append(dataset)
+                    self.stats['datasets_processed'] += 1
+                    # Update progress bar with current dataset name
+                    if dataset.name:
+                        dataset_build_progress.set_postfix({"current": dataset.name[:30]})
+            dataset_build_progress.close()
         
         logger.info(f"✅ Built {len(datasets)} datasets from offline data")
         return datasets
@@ -343,37 +428,236 @@ class PapersWithCodeOfflineLoader:
                                graph: PapersWithCodeGraph,
                                paper_limit: Optional[int] = 0,
                                dataset_limit: Optional[int] = 0,
-                               include_repositories: bool = True) -> Dict:
+                               include_repositories: bool = True,
+                               skip_datasets: bool = False,
+                               force_reload: bool = False,
+                               skip_if_exists: bool = False,
+                               clear_all: bool = False) -> Dict:
         """Load offline data and save to Neo4j knowledge graph"""
+        # Start timing
+        self.stats['start_time'] = datetime.now()
+        start_time = time.time()
+        
         logger.info("🚀 Starting offline data pipeline to Neo4j")
+        logger.info(f"⏰ Started at: {self.stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Handle clear-all flag first (implies force-reload)
+        if clear_all:
+            logger.info("💥 Clear all data enabled - wiping entire Neo4j database")
+            graph.clear_all_data()
+            logger.info("✅ Database cleared completely")
+            force_reload = True  # Automatically enable force-reload
+        
+        # Check existing data for smart resumption
+        if not force_reload and not clear_all:
+            logger.info("🔍 Checking existing data in Neo4j...")
+            existing_data = graph.check_existing_data()
+            logger.info(f"📊 Found existing data: {existing_data}")
+            
+            # Smart skip logic
+            if existing_data['datasets'] > 0 and not skip_datasets:
+                logger.info(f"✅ Found {existing_data['datasets']} datasets already loaded - skipping dataset phase")
+                skip_datasets = True
+            
+            if existing_data['papers'] > 0:
+                logger.info(f"⚠️  Found {existing_data['papers']} papers already loaded")
+                if skip_if_exists:
+                    logger.info("⏭️  Skipping all loading due to --skip-if-exists flag")
+                    return self.stats
+                elif not force_reload:
+                    logger.info("💡 To continue loading more papers, use --force-reload or --skip-datasets")
+                    logger.info("📋 Continuing with paper loading (appending to existing data)...")
+        elif force_reload:  # Only if force_reload is explicitly set (not from clear_all)
+            logger.info("🔄 Force reload enabled - will clear and reload specific data")
+            
+            # Clear existing data based on what we're loading (only if not already cleared by clear_all)
+            if not clear_all:
+                if not skip_datasets:
+                    # Clear datasets if we're going to load them
+                    graph.clear_datasets_only()
+                
+                # Always clear papers when force reloading (since we're likely loading papers)
+                graph.clear_papers_only()
         
         # Convert 0 to None (no limit) for consistent handling
         actual_paper_limit = None if paper_limit == 0 else paper_limit
         actual_dataset_limit = None if dataset_limit == 0 else dataset_limit
         
-        # Load datasets first
-        logger.info("Phase 1: Loading datasets")
-        datasets = self.build_datasets(actual_dataset_limit)
-        for dataset in datasets:
-            if dataset.save_to_neo4j():
-                logger.debug(f"Saved dataset: {dataset.name}")
-            else:
-                logger.error(f"Failed to save dataset: {dataset.name}")
+        # Phase 1: Load datasets (if not skipping)
+        phase1_duration = 0
+        if not skip_datasets:
+            logger.info("Phase 1: Loading datasets")
+            phase1_start = time.time()
+            datasets = self.build_datasets(actual_dataset_limit)
+            
+            # Save datasets with batch processing for speed
+            if datasets:
+                logger.info(f"💾 Saving {len(datasets)} datasets to Neo4j using batch processing...")
+                
+                batch_size = 50
+                total_batches = (len(datasets) + batch_size - 1) // batch_size
+                
+                dataset_progress = tqdm(
+                    range(total_batches),
+                    desc="Saving dataset batches", 
+                    unit="batch",
+                    mininterval=0.1
+                )
+                
+                total_saved = 0
+                total_failed = 0
+                
+                for batch_idx in dataset_progress:
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, len(datasets))
+                    batch = datasets[start_idx:end_idx]
+                    
+                    dataset_progress.set_postfix({
+                        "batch": f"{batch_idx+1}/{total_batches}",
+                        "items": f"{start_idx}-{end_idx-1}",
+                        "saved": total_saved,
+                        "failed": total_failed
+                    })
+                    
+                    # Process dataset batch with nested progress bar
+                    batch_progress = tqdm(
+                        range(1), 
+                        desc=f"  Saving dataset batch {batch_idx+1}", 
+                        unit="batch",
+                        leave=False,
+                        mininterval=0.1
+                    )
+                    
+                    for _ in batch_progress:
+                        batch_progress.set_postfix({
+                            "datasets": f"{len(batch)}",
+                            "processing": "..."
+                        })
+                        
+                        result = graph.batch_save_datasets(batch, batch_size)
+                        total_saved += result["saved"]
+                        total_failed += result["failed"]
+                        
+                        batch_progress.set_postfix({
+                            "datasets": f"{len(batch)}",
+                            "saved": result["saved"],
+                            "failed": result["failed"]
+                        })
+                    
+                    batch_progress.close()
+                
+                dataset_progress.close()
+                logger.info(f"📊 Dataset batch saving summary: {total_saved} saved, {total_failed} failed")
+            
+            phase1_duration = time.time() - phase1_start
+            logger.info(f"✅ Phase 1 complete: {phase1_duration:.2f} seconds")
+        else:
+            logger.info("⏭️  Phase 1: Skipping datasets (already loaded or --skip-datasets flag)")
+            phase1_start = time.time()
         
         # Load papers with repositories
         logger.info("Phase 2: Loading papers with code repositories")
+        phase2_start = time.time()
         papers = self.build_papers_with_code(actual_paper_limit, include_repositories)
         
-        for i, paper in enumerate(papers, 1):
-            if paper.save_to_neo4j():
-                if i % 10 == 0:
-                    logger.info(f"Saved {i}/{len(papers)} papers...")
-            else:
-                logger.error(f"Failed to save paper: {paper.title[:50]}...")
+        # Save papers with batch processing for much faster performance
+        if papers:
+            logger.info(f"💾 Saving {len(papers)} papers to Neo4j using batch processing...")
+            
+            batch_size = 100  # Larger batches for papers
+            total_batches = (len(papers) + batch_size - 1) // batch_size
+            
+            # Enhanced progress bar for batch processing
+            paper_progress = tqdm(
+                range(total_batches),
+                desc="Saving paper batches", 
+                unit="batch",
+                mininterval=0.5,
+                maxinterval=2.0
+            )
+            
+            total_saved = 0
+            total_failed = 0
+            
+            for batch_idx in paper_progress:
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, len(papers))
+                batch = papers[start_idx:end_idx]
+                
+                # Calculate current rates
+                elapsed = time.time() - phase2_start if batch_idx > 0 else 1
+                current_papers_processed = min(end_idx, len(papers))
+                rate = current_papers_processed / elapsed
+                
+                # Calculate ETA
+                remaining_papers = len(papers) - current_papers_processed
+                eta_seconds = remaining_papers / rate if rate > 0 else 0
+                eta_hours = eta_seconds / 3600
+                
+                # Update progress bar with detailed info
+                paper_progress.set_postfix({
+                    "batch": f"{batch_idx+1}/{total_batches}",
+                    "papers": f"{start_idx}-{end_idx-1}",
+                    "saved": total_saved,
+                    "failed": total_failed,
+                    "rate": f"{rate:.1f}/s",
+                    "ETA": f"{eta_hours:.1f}h"
+                })
+                
+                # Process batch with nested progress bar
+                batch_progress = tqdm(
+                    range(1), 
+                    desc=f"  Saving batch {batch_idx+1}", 
+                    unit="batch",
+                    leave=False,  # Don't leave the nested progress bar
+                    mininterval=0.1
+                )
+                
+                for _ in batch_progress:
+                    batch_progress.set_postfix({
+                        "papers": f"{len(batch)}",
+                        "processing": "..."
+                    })
+                    
+                    result = graph.batch_save_papers(batch, batch_size)
+                    total_saved += result["saved"]
+                    total_failed += result["failed"]
+                    
+                    batch_progress.set_postfix({
+                        "papers": f"{len(batch)}",
+                        "saved": result["saved"], 
+                        "failed": result["failed"]
+                    })
+                
+                batch_progress.close()
+                
+                # Detailed logging every 10 batches for very large datasets
+                if (batch_idx + 1) % 10 == 0:
+                    progress_pct = (current_papers_processed / len(papers)) * 100
+                    logger.info(f"📊 Batch Progress: {current_papers_processed}/{len(papers)} papers ({progress_pct:.1f}%) - Rate: {rate:.1f} papers/s - ETA: {eta_hours:.1f}h")
+            
+            paper_progress.close()
+            logger.info(f"📊 Paper batch saving summary: {total_saved} saved, {total_failed} failed")
         
-        # Final statistics
+        phase2_duration = time.time() - phase2_start
+        logger.info(f"✅ Phase 2 complete: {phase2_duration:.2f} seconds")
+        
+        # End timing
+        end_time = time.time()
+        self.stats['end_time'] = datetime.now()
+        self.stats['duration_seconds'] = end_time - start_time
+        
+        # Calculate and display timing information
+        duration = self.stats['end_time'] - self.stats['start_time']
+        hours, remainder = divmod(self.stats['duration_seconds'], 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        # Final statistics with timing
         logger.info("📊 Pipeline complete!")
-        logger.info(f"Statistics: {self.stats}")
+        logger.info(f"⏰ Finished at: {self.stats['end_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"⏱️  Total duration: {int(hours):02d}:{int(minutes):02d}:{int(seconds):02d} ({self.stats['duration_seconds']:.2f} seconds)")
+        logger.info(f"📈 Processing rate: {self.stats['papers_processed'] / max(self.stats['duration_seconds'], 1):.1f} papers/second")
+        logger.info(f"📊 Statistics: {self.stats}")
         
         # Get Neo4j graph statistics
         try:
@@ -395,14 +679,28 @@ class PapersWithCodeOfflineLoader:
         # Check each dataset
         for dataset_key in ['papers', 'links', 'datasets', 'methods', 'evaluations']:
             try:
-                # Try to load a few records
-                records = getattr(self, f'load_{dataset_key}' if dataset_key != 'datasets' else 'load_datasets_json')(5)
-                summary['files_available'][dataset_key] = len(records) > 0
-                if records:
-                    summary['sample_records'][dataset_key] = records[0]
+                # Check if file exists without loading (to avoid caching limited data)
+                filename_mapping = {
+                    'papers': 'papers-with-abstracts.json',
+                    'links': 'links-between-papers-and-code.json', 
+                    'datasets': 'datasets.json',
+                    'methods': 'methods.json',
+                    'evaluations': 'evaluation-tables.json'
+                }
+                
+                file_path = self.data_dir / filename_mapping[dataset_key]
+                if file_path.exists():
+                    summary['files_available'][dataset_key] = True
+                    # Load just 1 record for sample without caching
+                    if hasattr(self, 'downloader'):
+                        sample_records = self.downloader.load_json_file(dataset_key, 1)
+                        if sample_records:
+                            summary['sample_records'][dataset_key] = sample_records[0]
+                else:
+                    summary['files_available'][dataset_key] = False
             except Exception as e:
                 summary['files_available'][dataset_key] = False
-                logger.warning(f"Could not load {dataset_key}: {e}")
+                logger.warning(f"Could not check {dataset_key}: {e}")
         
         return summary
 
@@ -457,6 +755,26 @@ def main():
         action="store_true",
         help="Exclude repository links"
     )
+    parser.add_argument(
+        "--skip-datasets",
+        action="store_true",
+        help="Skip dataset loading and go directly to papers"
+    )
+    parser.add_argument(
+        "--force-reload",
+        action="store_true", 
+        help="Force reload all data even if already exists in Neo4j"
+    )
+    parser.add_argument(
+        "--skip-if-exists",
+        action="store_true",
+        help="Skip loading if data already exists in Neo4j"
+    )
+    parser.add_argument(
+        "--clear-all",
+        action="store_true",
+        help="Clear ALL data from Neo4j before loading (implies --force-reload)"
+    )
     
     args = parser.parse_args()
     
@@ -508,14 +826,19 @@ def main():
             logger.info("   4. Use --neo4j-password YOUR_ACTUAL_PASSWORD")
             return
         
-        # Load data with specified limits
+        # Load data with specified limits and flags
         logger.info(f"Loading with limits - Papers: {args.paper_limit}, Datasets: {args.dataset_limit}, Include Repos: {include_repositories}")
+        logger.info(f"Flags - Skip Datasets: {args.skip_datasets}, Force Reload: {args.force_reload}, Skip If Exists: {args.skip_if_exists}, Clear All: {args.clear_all}")
         
         stats = loader.load_and_save_to_neo4j(
             graph=graph,
             paper_limit=args.paper_limit,
             dataset_limit=args.dataset_limit,
-            include_repositories=include_repositories
+            include_repositories=include_repositories,
+            skip_datasets=args.skip_datasets,
+            force_reload=args.force_reload,
+            skip_if_exists=args.skip_if_exists,
+            clear_all=args.clear_all
         )
         
         logger.info("Pipeline completed successfully!")
