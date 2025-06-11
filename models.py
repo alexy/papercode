@@ -169,8 +169,9 @@ class Repository(BaseModel, Neo4jMixin):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     
-    @validator('framework', pre=True)
+    @classmethod
     def parse_framework(cls, v):
+        """Class method to parse framework from string"""
         if isinstance(v, str):
             v_lower = v.lower().strip()
             # Direct match first
@@ -195,6 +196,10 @@ class Repository(BaseModel, Neo4jMixin):
                 else:
                     return Framework.OTHER
         return v if v else Framework.NONE
+    
+    @validator('framework', pre=True)
+    def validate_framework(cls, v):
+        return cls.parse_framework(v)
     
     def save_to_neo4j(self) -> bool:
         """Save repository to Neo4j"""
