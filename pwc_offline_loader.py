@@ -3,7 +3,7 @@
 import json
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Optional, Set, Any
 from datetime import datetime
 import time
 
@@ -424,6 +424,128 @@ class PapersWithCodeOfflineLoader:
         logger.info(f"✅ Built {len(repositories)} unique repositories from offline data")
         return repositories
     
+    def rebuild_models_from_data(self) -> Dict[str, Any]:
+        """Rebuild Pydantic models from existing data without database dependency"""
+        logger.info("🔨 Rebuilding Pydantic models from offline data...")
+        
+        rebuilt_models = {
+            'papers': [],
+            'datasets': [],
+            'repositories': [],
+            'stats': {
+                'papers_rebuilt': 0,
+                'datasets_rebuilt': 0,
+                'repositories_rebuilt': 0,
+                'errors': 0
+            }
+        }
+        
+        # Rebuild datasets
+        try:
+            datasets_data = self.load_datasets_json()
+            for dataset_data in datasets_data:
+                dataset = self.parse_dataset(dataset_data)
+                if dataset:
+                    rebuilt_models['datasets'].append(dataset)
+                    rebuilt_models['stats']['datasets_rebuilt'] += 1
+                else:
+                    rebuilt_models['stats']['errors'] += 1
+        except Exception as e:
+            logger.error(f"Error rebuilding datasets: {e}")
+        
+        # Rebuild repositories
+        try:
+            links_data = self.load_links()
+            seen_urls = set()
+            for link_data in links_data:
+                repo = self.parse_repository(link_data)
+                if repo and repo.url not in seen_urls:
+                    rebuilt_models['repositories'].append(repo)
+                    rebuilt_models['stats']['repositories_rebuilt'] += 1
+                    seen_urls.add(repo.url)
+                elif not repo:
+                    rebuilt_models['stats']['errors'] += 1
+        except Exception as e:
+            logger.error(f"Error rebuilding repositories: {e}")
+        
+        # Rebuild papers with repositories
+        try:
+            papers_data = self.load_papers()
+            repo_mapping = self.build_paper_repository_mapping()
+            
+            for paper_data in papers_data:
+                paper = self.parse_paper(paper_data)
+                if paper:
+                    # Add repositories from mapping
+                    if paper.id in repo_mapping:
+                        paper.repositories = repo_mapping[paper.id]
+                    rebuilt_models['papers'].append(paper)
+                    rebuilt_models['stats']['papers_rebuilt'] += 1
+                else:
+                    rebuilt_models['stats']['errors'] += 1
+        except Exception as e:
+            logger.error(f"Error rebuilding papers: {e}")
+        
+        logger.info(f"✅ Model rebuilding complete: {rebuilt_models['stats']}")
+        return rebuilt_models
+    
+    def load_to_new_neo4j_instance(self,
+                                   new_neo4j_uri: str,
+                                   new_neo4j_user: str = "neo4j",
+                                   new_neo4j_password: str = "password",
+                                   paper_limit: Optional[int] = 0,
+                                   dataset_limit: Optional[int] = 0,
+                                   include_repositories: bool = True,
+                                   clear_target: bool = False,
+                                   drop_all_target: bool = False) -> Dict:
+        """Load data directly to a new Neo4j instance with rebuilt models"""
+        logger.info(f"🔄 Loading data to new Neo4j instance: {new_neo4j_uri}")
+        
+        try:
+            # Create new graph connection
+            from models import PapersWithCodeGraph
+            new_graph = PapersWithCodeGraph(new_neo4j_uri, new_neo4j_user, new_neo4j_password)
+            
+            # Test connection
+            new_graph.get_graph_stats()
+            logger.info("✅ New Neo4j connection successful")
+            
+            # Handle dangerous drop-all-target first
+            if drop_all_target:
+                if confirm_dangerous_operation("DROP ALL TARGET DATA", new_neo4j_uri):
+                    logger.info("💥 Dropping ALL data from target Neo4j instance...")
+                    new_graph.clear_all_data()
+                    logger.info("✅ Target database completely cleared")
+                else:
+                    logger.info("❌ Operation cancelled by user")
+                    new_graph.close()
+                    return {}
+            # Clear target if requested (only PWC data types)
+            elif clear_target:
+                logger.info("🗑️ Selectively clearing Papers with Code data from target Neo4j instance...")
+                cleared_data = new_graph.clear_pwc_data_only()
+                logger.info(f"✅ Cleared PWC data: {cleared_data}")
+                # Also clear PWC-specific indexes
+                new_graph.clear_pwc_indexes_only()
+            
+            # Load data using the existing pipeline but with new graph
+            stats = self.load_and_save_to_neo4j(
+                graph=new_graph,
+                paper_limit=paper_limit,
+                dataset_limit=dataset_limit,
+                include_repositories=include_repositories,
+                rebuild_models=True,
+                force_reload=True
+            )
+            
+            new_graph.close()
+            logger.info(f"✅ Data successfully loaded to new Neo4j instance")
+            return stats
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to load to new Neo4j instance: {e}")
+            raise
+    
     def load_and_save_to_neo4j(self, 
                                graph: PapersWithCodeGraph,
                                paper_limit: Optional[int] = 0,
@@ -432,7 +554,9 @@ class PapersWithCodeOfflineLoader:
                                skip_datasets: bool = False,
                                force_reload: bool = False,
                                skip_if_exists: bool = False,
-                               clear_all: bool = False) -> Dict:
+                               clear_all: bool = False,
+                               rebuild_models: bool = False,
+                               drop_all: bool = False) -> Dict:
         """Load offline data and save to Neo4j knowledge graph"""
         # Start timing
         self.stats['start_time'] = datetime.now()
@@ -441,15 +565,27 @@ class PapersWithCodeOfflineLoader:
         logger.info("🚀 Starting offline data pipeline to Neo4j")
         logger.info(f"⏰ Started at: {self.stats['start_time'].strftime('%Y-%m-%d %H:%M:%S')}")
         
-        # Handle clear-all flag first (implies force-reload)
-        if clear_all:
-            logger.info("💥 Clear all data enabled - wiping entire Neo4j database")
-            graph.clear_all_data()
-            logger.info("✅ Database cleared completely")
+        # Handle dangerous drop-all flag first
+        if drop_all:
+            if confirm_dangerous_operation("DROP ALL LOCAL DATA", "Local Neo4j database"):
+                logger.info("💥 Dropping ALL data from local Neo4j instance...")
+                graph.clear_all_data()
+                logger.info("✅ Local database completely cleared")
+                force_reload = True  # Automatically enable force-reload
+            else:
+                logger.info("❌ Operation cancelled by user")
+                return {}
+        # Handle clear-all flag (implies force-reload)
+        elif clear_all:
+            logger.info("💥 Clear all Papers with Code data enabled - clearing PWC data types only")
+            cleared_data = graph.clear_pwc_data_only()
+            logger.info(f"✅ PWC data cleared: {cleared_data}")
+            # Also clear PWC-specific indexes
+            graph.clear_pwc_indexes_only()
             force_reload = True  # Automatically enable force-reload
         
         # Check existing data for smart resumption
-        if not force_reload and not clear_all:
+        if not force_reload and not clear_all and not drop_all:
             logger.info("🔍 Checking existing data in Neo4j...")
             existing_data = graph.check_existing_data()
             logger.info(f"📊 Found existing data: {existing_data}")
@@ -470,8 +606,8 @@ class PapersWithCodeOfflineLoader:
         elif force_reload:  # Only if force_reload is explicitly set (not from clear_all)
             logger.info("🔄 Force reload enabled - will clear and reload specific data")
             
-            # Clear existing data based on what we're loading (only if not already cleared by clear_all)
-            if not clear_all:
+            # Clear existing data based on what we're loading (only if not already cleared by clear_all or drop_all)
+            if not clear_all and not drop_all:
                 if not skip_datasets:
                     # Clear datasets if we're going to load them
                     graph.clear_datasets_only()
@@ -704,6 +840,35 @@ class PapersWithCodeOfflineLoader:
         
         return summary
 
+def confirm_dangerous_operation(operation_type: str, target_description: str) -> bool:
+    """Request user confirmation for dangerous operations that delete all data"""
+    print("\n" + "="*80)
+    print("🚨 DANGER: DESTRUCTIVE OPERATION WARNING 🚨")
+    print("="*80)
+    print(f"Operation: {operation_type}")
+    print(f"Target: {target_description}")
+    print("This will DELETE ALL DATA in the specified Neo4j database!")
+    print("This action is IRREVERSIBLE and will destroy:")
+    print("  • All nodes of every type")
+    print("  • All relationships")
+    print("  • All indexes")
+    print("  • All constraints")
+    print("  • Everything in the database")
+    print("="*80)
+    
+    # Require explicit confirmation
+    confirmation_text = "DELETE ALL DATA"
+    print(f"To confirm this destructive operation, type exactly: {confirmation_text}")
+    user_input = input("Confirmation: ").strip()
+    
+    if user_input == confirmation_text:
+        print("⚠️  Confirmation received. Proceeding with destructive operation...")
+        return True
+    else:
+        print("❌ Confirmation not received. Operation cancelled.")
+        print("Database preserved - no changes made.")
+        return False
+
 def main():
     """Main function to run offline data loading pipeline"""
     import argparse
@@ -773,10 +938,64 @@ def main():
     parser.add_argument(
         "--clear-all",
         action="store_true",
-        help="Clear ALL data from Neo4j before loading (implies --force-reload)"
+        help="Clear Papers with Code data from local Neo4j instance before loading (preserves other data types, implies --force-reload)"
+    )
+    parser.add_argument(
+        "--new-neo4j-uri",
+        help="Load data to a different Neo4j instance (alternative to default URI)"
+    )
+    parser.add_argument(
+        "--new-neo4j-user",
+        default="neo4j",
+        help="Username for new Neo4j instance (default: neo4j)"
+    )
+    parser.add_argument(
+        "--new-neo4j-password",
+        default="password",
+        help="Password for new Neo4j instance (default: password)"
+    )
+    parser.add_argument(
+        "--clear-target",
+        action="store_true",
+        help="Clear Papers with Code data from target Neo4j instance before loading (preserves other data types)"
+    )
+    parser.add_argument(
+        "--rebuild-models",
+        action="store_true",
+        help="Rebuild Pydantic models from data before loading"
+    )
+    parser.add_argument(
+        "--drop-all",
+        action="store_true",
+        help="⚠️  DANGER: Drop ALL data from local Neo4j database (requires confirmation)"
+    )
+    parser.add_argument(
+        "--drop-all-target",
+        action="store_true",
+        help="⚠️  DANGER: Drop ALL data from target Neo4j database (requires confirmation, use with --new-neo4j-uri)"
     )
     
     args = parser.parse_args()
+    
+    # Validate conflicting arguments
+    if args.drop_all and args.clear_all:
+        logger.error("❌ Cannot use both --drop-all and --clear-all flags")
+        logger.error("   --drop-all: Destroys ALL data in database")
+        logger.error("   --clear-all: Only clears Papers with Code data")
+        logger.error("   Choose one based on your needs")
+        return
+    
+    if args.drop_all_target and args.clear_target:
+        logger.error("❌ Cannot use both --drop-all-target and --clear-target flags")
+        logger.error("   --drop-all-target: Destroys ALL data in target database")
+        logger.error("   --clear-target: Only clears Papers with Code data from target")
+        logger.error("   Choose one based on your needs")
+        return
+    
+    if args.drop_all_target and not args.new_neo4j_uri:
+        logger.error("❌ --drop-all-target requires --new-neo4j-uri")
+        logger.error("   You must specify a target database to drop all data from")
+        return
     
     # Determine data directory
     if args.data_dir:
@@ -807,39 +1026,58 @@ def main():
             status = "✅" if available else "❌"
             logger.info(f"   {status} {dataset_key}")
         
-        # Initialize knowledge graph
-        logger.info("Initializing Papers with Code Knowledge Graph")
-        logger.info(f"Neo4j URI: {args.neo4j_uri}")
-        logger.info(f"Neo4j User: {args.neo4j_user}")
-        
-        try:
-            graph = PapersWithCodeGraph(args.neo4j_uri, args.neo4j_user, args.neo4j_password)
-            # Test connection
-            graph.get_graph_stats()
-            logger.info("✅ Neo4j connection successful")
-        except Exception as e:
-            logger.error(f"❌ Neo4j connection failed: {e}")
-            logger.info("💡 Troubleshooting tips:")
-            logger.info("   1. Make sure Neo4j is running (check http://localhost:7474)")
-            logger.info("   2. Verify your password with: python test_neo4j_connection.py")
-            logger.info("   3. For Docker: docker run -p 7474:7474 -p 7687:7687 neo4j:latest")
-            logger.info("   4. Use --neo4j-password YOUR_ACTUAL_PASSWORD")
-            return
-        
-        # Load data with specified limits and flags
-        logger.info(f"Loading with limits - Papers: {args.paper_limit}, Datasets: {args.dataset_limit}, Include Repos: {include_repositories}")
-        logger.info(f"Flags - Skip Datasets: {args.skip_datasets}, Force Reload: {args.force_reload}, Skip If Exists: {args.skip_if_exists}, Clear All: {args.clear_all}")
-        
-        stats = loader.load_and_save_to_neo4j(
-            graph=graph,
-            paper_limit=args.paper_limit,
-            dataset_limit=args.dataset_limit,
-            include_repositories=include_repositories,
-            skip_datasets=args.skip_datasets,
-            force_reload=args.force_reload,
-            skip_if_exists=args.skip_if_exists,
-            clear_all=args.clear_all
-        )
+        # Check if we're loading to a new Neo4j instance
+        if args.new_neo4j_uri:
+            logger.info(f"🔄 Loading to new Neo4j instance: {args.new_neo4j_uri}")
+            logger.info(f"New Neo4j User: {args.new_neo4j_user}")
+            
+            # Use the new loading method
+            stats = loader.load_to_new_neo4j_instance(
+                new_neo4j_uri=args.new_neo4j_uri,
+                new_neo4j_user=args.new_neo4j_user,
+                new_neo4j_password=args.new_neo4j_password,
+                paper_limit=args.paper_limit,
+                dataset_limit=args.dataset_limit,
+                include_repositories=include_repositories,
+                clear_target=args.clear_target,
+                drop_all_target=args.drop_all_target
+            )
+        else:
+            # Initialize knowledge graph (original behavior)
+            logger.info("Initializing Papers with Code Knowledge Graph")
+            logger.info(f"Neo4j URI: {args.neo4j_uri}")
+            logger.info(f"Neo4j User: {args.neo4j_user}")
+            
+            try:
+                graph = PapersWithCodeGraph(args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+                # Test connection
+                graph.get_graph_stats()
+                logger.info("✅ Neo4j connection successful")
+            except Exception as e:
+                logger.error(f"❌ Neo4j connection failed: {e}")
+                logger.info("💡 Troubleshooting tips:")
+                logger.info("   1. Make sure Neo4j is running (check http://localhost:7474)")
+                logger.info("   2. Verify your password with: python test_neo4j_connection.py")
+                logger.info("   3. For Docker: docker run -p 7474:7474 -p 7687:7687 neo4j:latest")
+                logger.info("   4. Use --neo4j-password YOUR_ACTUAL_PASSWORD")
+                return
+            
+            # Load data with specified limits and flags
+            logger.info(f"Loading with limits - Papers: {args.paper_limit}, Datasets: {args.dataset_limit}, Include Repos: {include_repositories}")
+            logger.info(f"Flags - Skip Datasets: {args.skip_datasets}, Force Reload: {args.force_reload}, Skip If Exists: {args.skip_if_exists}, Clear All: {args.clear_all}, Drop All: {args.drop_all}, Rebuild Models: {args.rebuild_models}")
+            
+            stats = loader.load_and_save_to_neo4j(
+                graph=graph,
+                paper_limit=args.paper_limit,
+                dataset_limit=args.dataset_limit,
+                include_repositories=include_repositories,
+                skip_datasets=args.skip_datasets,
+                force_reload=args.force_reload,
+                skip_if_exists=args.skip_if_exists,
+                clear_all=args.clear_all,
+                rebuild_models=args.rebuild_models,
+                drop_all=args.drop_all
+            )
         
         logger.info("Pipeline completed successfully!")
         

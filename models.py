@@ -834,6 +834,92 @@ class PapersWithCodeGraph:
             logger.error(f"Failed to clear datasets: {e}")
             return 0
     
+    def clear_pwc_data_only(self) -> Dict[str, int]:
+        """Clear only Papers with Code specific data types and relationships"""
+        try:
+            session = Paper.get_session()
+            
+            # Define our specific node types
+            pwc_node_types = ['Paper', 'Repository', 'Dataset', 'Task', 'Author']
+            # Define our specific relationship types
+            pwc_relationship_types = ['AUTHORED', 'HAS_CODE', 'USES_DATASET', 'ADDRESSES_TASK']
+            
+            # Count existing data before deletion
+            existing_data = {}
+            for node_type in pwc_node_types:
+                try:
+                    result = session.run(f"MATCH (n:{node_type}) RETURN count(n) as count")
+                    record = result.single()
+                    existing_data[node_type.lower()] = record['count'] if record else 0
+                except:
+                    existing_data[node_type.lower()] = 0
+            
+            total_nodes = sum(existing_data.values())
+            
+            if total_nodes > 0:
+                logger.info(f"🗑️  Selectively clearing Papers with Code data from Neo4j...")
+                logger.info(f"   Node types to clear: {', '.join(pwc_node_types)}")
+                logger.info(f"   Relationship types to clear: {', '.join(pwc_relationship_types)}")
+                
+                # First, delete our specific relationships
+                for rel_type in pwc_relationship_types:
+                    try:
+                        result = session.run(f"MATCH ()-[r:{rel_type}]-() DELETE r")
+                        logger.info(f"   ✅ Cleared {rel_type} relationships")
+                    except Exception as e:
+                        logger.warning(f"   ⚠️  Could not clear {rel_type} relationships: {e}")
+                
+                # Then delete our specific node types
+                for node_type in pwc_node_types:
+                    try:
+                        # First delete any remaining relationships to these nodes
+                        session.run(f"MATCH (n:{node_type})-[r]-() DELETE r")
+                        # Then delete the nodes
+                        result = session.run(f"MATCH (n:{node_type}) DELETE n")
+                        if existing_data[node_type.lower()] > 0:
+                            logger.info(f"   ✅ Cleared {existing_data[node_type.lower()]} {node_type} nodes")
+                    except Exception as e:
+                        logger.warning(f"   ⚠️  Could not clear {node_type} nodes: {e}")
+                
+                logger.info(f"✅ Selective clearing complete - cleared {total_nodes} PWC nodes")
+            else:
+                logger.info("ℹ️  No Papers with Code data found to clear")
+            
+            return existing_data
+            
+        except Exception as e:
+            logger.error(f"Failed to selectively clear PWC data: {e}")
+            return {'papers': 0, 'datasets': 0, 'repositories': 0, 'authors': 0, 'tasks': 0}
+    
+    def clear_pwc_indexes_only(self):
+        """Clear only Papers with Code specific indexes"""
+        try:
+            session = Paper.get_session()
+            
+            # Define our specific indexes
+            pwc_indexes = [
+                "paper_id_index",
+                "paper_arxiv_index", 
+                "repo_url_index",
+                "author_name_index",
+                "dataset_id_index",
+                "task_id_index"
+            ]
+            
+            logger.info("🗑️  Clearing Papers with Code specific indexes...")
+            
+            for index_name in pwc_indexes:
+                try:
+                    session.run(f"DROP INDEX {index_name} IF EXISTS")
+                    logger.info(f"   ✅ Dropped index: {index_name}")
+                except Exception as e:
+                    logger.debug(f"   ℹ️  Index {index_name} may not exist: {e}")
+            
+            logger.info("✅ PWC indexes cleared")
+            
+        except Exception as e:
+            logger.warning(f"Could not clear PWC indexes: {e}")
+    
     def check_existing_data(self) -> Dict[str, int]:
         """Check what data already exists in Neo4j"""
         try:
