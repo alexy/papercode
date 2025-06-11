@@ -39,7 +39,7 @@ class Neo4jMixin:
         """Get or create Neo4j session"""
         if not hasattr(cls, '_driver'):
             raise ValueError("Neo4j not initialized. Call init_neo4j() first.")
-        if cls._session is None:
+        if cls._session is None or cls._session.closed():
             cls._session = cls._driver.session()
         return cls._session
     
@@ -224,6 +224,9 @@ class Repository(BaseModel, Neo4jMixin):
                 data['created_at'] = data['created_at'].isoformat()
             if data.get('framework'):
                 data['framework'] = data['framework'].value if hasattr(data['framework'], 'value') else str(data['framework'])
+            # Convert HttpUrl to string for Neo4j
+            if data.get('url'):
+                data['url'] = str(data['url'])
             
             result = session.run(query, **data)
             return result.single() is not None
@@ -292,6 +295,9 @@ class Paper(BaseModel, Neo4jMixin):
             paper_data = self.dict(exclude={'authors', 'repositories', 'datasets', 'tasks'})
             if paper_data.get('published'):
                 paper_data['published'] = paper_data['published'].isoformat()
+            # Convert HttpUrl to string for Neo4j
+            if paper_data.get('url_abs'):
+                paper_data['url_abs'] = str(paper_data['url_abs'])
             
             result = session.run(paper_query, **paper_data)
             if not result.single():
@@ -349,39 +355,59 @@ class Paper(BaseModel, Neo4jMixin):
         try:
             session = cls.get_session()
             
-            # Load paper with all relationships
-            query = """
-            MATCH (p:Paper {id: $id})
-            OPTIONAL MATCH (a:Author)-[:AUTHORED]->(p)
-            OPTIONAL MATCH (p)-[:HAS_CODE]->(r:Repository)
-            OPTIONAL MATCH (p)-[:USES_DATASET]->(d:Dataset)
-            OPTIONAL MATCH (p)-[:ADDRESSES_TASK]->(t:Task)
-            RETURN p,
-                   collect(DISTINCT a) as authors,
-                   collect(DISTINCT r) as repositories,
-                   collect(DISTINCT d.id) as datasets,
-                   collect(DISTINCT t.id) as tasks
-            """
-            
-            result = session.run(query, id=paper_id)
+            # First load just the paper
+            paper_query = "MATCH (p:Paper {id: $id}) RETURN p"
+            result = session.run(paper_query, id=paper_id)
             record = result.single()
             
-            if record:
-                paper_data = dict(record['p'])
-                
-                # Convert datetime
-                if paper_data.get('published'):
-                    paper_data['published'] = datetime.fromisoformat(paper_data['published'])
-                
-                # Add relationships
-                paper_data['authors'] = [Author(**dict(a)) for a in record['authors'] if a]
-                paper_data['repositories'] = [Repository(**dict(r)) for r in record['repositories'] if r]
-                paper_data['datasets'] = [d for d in record['datasets'] if d]
-                paper_data['tasks'] = [t for t in record['tasks'] if t]
-                
-                return cls(**paper_data)
+            if not record:
+                return None
             
-            return None
+            paper_data = dict(record['p'])
+            
+            # Convert datetime
+            if paper_data.get('published'):
+                paper_data['published'] = datetime.fromisoformat(paper_data['published'])
+            
+            # Initialize relationship lists
+            paper_data['authors'] = []
+            paper_data['repositories'] = []
+            paper_data['datasets'] = []
+            paper_data['tasks'] = []
+            
+            # Load authors
+            try:
+                author_query = "MATCH (a:Author)-[:AUTHORED]->(p:Paper {id: $id}) RETURN a"
+                result = session.run(author_query, id=paper_id)
+                paper_data['authors'] = [Author(**dict(record['a'])) for record in result if record['a']]
+            except Exception:
+                pass  # No authors or relationship doesn't exist
+            
+            # Load repositories
+            try:
+                repo_query = "MATCH (p:Paper {id: $id})-[:HAS_CODE]->(r:Repository) RETURN r"
+                result = session.run(repo_query, id=paper_id)
+                paper_data['repositories'] = [Repository(**dict(record['r'])) for record in result if record['r']]
+            except Exception:
+                pass  # No repositories or relationship doesn't exist
+            
+            # Load datasets
+            try:
+                dataset_query = "MATCH (p:Paper {id: $id})-[:USES_DATASET]->(d:Dataset) RETURN d.id as id"
+                result = session.run(dataset_query, id=paper_id)
+                paper_data['datasets'] = [record['id'] for record in result if record['id']]
+            except Exception:
+                pass  # No datasets or relationship doesn't exist
+            
+            # Load tasks
+            try:
+                task_query = "MATCH (p:Paper {id: $id})-[:ADDRESSES_TASK]->(t:Task) RETURN t.id as id"
+                result = session.run(task_query, id=paper_id)
+                paper_data['tasks'] = [record['id'] for record in result if record['id']]
+            except Exception:
+                pass  # No tasks or relationship doesn't exist
+            
+            return cls(**paper_data)
             
         except Exception as e:
             logger.error(f"Error loading paper from Neo4j: {e}")
@@ -392,6 +418,15 @@ class Paper(BaseModel, Neo4jMixin):
         """Find all papers that use a specific code repository"""
         try:
             session = cls.get_session()
+            
+            # First check if the repository exists
+            repo_check = session.run("MATCH (r:Repository {url: $repo_url}) RETURN count(r) as count", repo_url=repo_url)
+            repo_record = repo_check.single()
+            
+            if not repo_record or repo_record['count'] == 0:
+                logger.info(f"Repository not found in database: {repo_url}")
+                return []
+            
             query = """
             MATCH (p:Paper)-[:HAS_CODE]->(r:Repository {url: $repo_url})
             RETURN p.id as paper_id
@@ -415,6 +450,15 @@ class Paper(BaseModel, Neo4jMixin):
         """Find all code repositories associated with a paper"""
         try:
             session = cls.get_session()
+            
+            # First check if the paper exists
+            paper_check = session.run("MATCH (p:Paper {id: $paper_id}) RETURN count(p) as count", paper_id=paper_id)
+            paper_record = paper_check.single()
+            
+            if not paper_record or paper_record['count'] == 0:
+                logger.info(f"Paper not found in database: {paper_id}")
+                return []
+            
             query = """
             MATCH (p:Paper {id: $paper_id})-[:HAS_CODE]->(r:Repository)
             RETURN r.url as repo_url
@@ -465,7 +509,7 @@ class PapersWithCodeGraph:
             logger.info("Neo4j indexes created successfully")
             
         except Exception as e:
-            logger.error(f"Error creating indexes: {e}")
+            logger.warning(f"Could not create indexes (this is normal for new databases): {e}")
     
     def close(self):
         """Close all Neo4j connections"""
@@ -476,28 +520,51 @@ class PapersWithCodeGraph:
         try:
             session = Paper.get_session()
             
-            stats_query = """
-            MATCH (p:Paper) WITH count(p) as papers
-            MATCH (r:Repository) WITH papers, count(r) as repos
-            MATCH (a:Author) WITH papers, repos, count(a) as authors
-            MATCH (d:Dataset) WITH papers, repos, authors, count(d) as datasets
-            MATCH (t:Task) WITH papers, repos, authors, datasets, count(t) as tasks
-            MATCH (p:Paper)-[:HAS_CODE]->(r:Repository) WITH papers, repos, authors, datasets, tasks, count(*) as paper_code_links
-            RETURN papers, repos, authors, datasets, tasks, paper_code_links
-            """
+            # Get individual counts first to avoid complex WITH clauses
+            stats = {}
             
-            result = session.run(stats_query)
+            # Count papers
+            result = session.run("MATCH (p:Paper) RETURN count(p) as count")
             record = result.single()
+            stats['papers'] = record['count'] if record else 0
             
-            return {
-                'papers': record['papers'],
-                'repositories': record['repos'],
-                'authors': record['authors'],
-                'datasets': record['datasets'],
-                'tasks': record['tasks'],
-                'paper_code_links': record['paper_code_links']
-            }
+            # Count repositories
+            result = session.run("MATCH (r:Repository) RETURN count(r) as count")
+            record = result.single()
+            stats['repositories'] = record['count'] if record else 0
+            
+            # Count authors
+            result = session.run("MATCH (a:Author) RETURN count(a) as count")
+            record = result.single()
+            stats['authors'] = record['count'] if record else 0
+            
+            # Count datasets
+            result = session.run("MATCH (d:Dataset) RETURN count(d) as count")
+            record = result.single()
+            stats['datasets'] = record['count'] if record else 0
+            
+            # Count tasks
+            result = session.run("MATCH (t:Task) RETURN count(t) as count")
+            record = result.single()
+            stats['tasks'] = record['count'] if record else 0
+            
+            # Count paper-code relationships (only if both nodes exist)
+            if stats['papers'] > 0 and stats['repositories'] > 0:
+                result = session.run("MATCH (p:Paper)-[:HAS_CODE]->(r:Repository) RETURN count(*) as count")
+                record = result.single()
+                stats['paper_code_links'] = record['count'] if record else 0
+            else:
+                stats['paper_code_links'] = 0
+            
+            return stats
             
         except Exception as e:
             logger.error(f"Error getting graph stats: {e}")
-            return {}
+            return {
+                'papers': 0,
+                'repositories': 0,
+                'authors': 0,
+                'datasets': 0,
+                'tasks': 0,
+                'paper_code_links': 0
+            }

@@ -49,7 +49,9 @@ class PapersWithCodeOfflineLoader:
         """Load papers from JSON file"""
         if self._papers_cache is None:
             logger.info("📖 Loading papers dataset...")
-            self._papers_cache = self.downloader.load_json_file('papers', limit)
+            # Convert 0 to None (no limit) for the downloader
+            actual_limit = None if limit == 0 else limit
+            self._papers_cache = self.downloader.load_json_file('papers', actual_limit)
             if self._papers_cache is None:
                 self._papers_cache = []
         
@@ -59,7 +61,9 @@ class PapersWithCodeOfflineLoader:
         """Load paper-code links from JSON file"""
         if self._links_cache is None:
             logger.info("📖 Loading paper-code links dataset...")
-            self._links_cache = self.downloader.load_json_file('links', limit)
+            # Convert 0 to None (no limit) for the downloader
+            actual_limit = None if limit == 0 else limit
+            self._links_cache = self.downloader.load_json_file('links', actual_limit)
             if self._links_cache is None:
                 self._links_cache = []
         
@@ -69,7 +73,9 @@ class PapersWithCodeOfflineLoader:
         """Load datasets from JSON file"""
         if self._datasets_cache is None:
             logger.info("📖 Loading datasets dataset...")
-            self._datasets_cache = self.downloader.load_json_file('datasets', limit)
+            # Convert 0 to None (no limit) for the downloader
+            actual_limit = None if limit == 0 else limit
+            self._datasets_cache = self.downloader.load_json_file('datasets', actual_limit)
             if self._datasets_cache is None:
                 self._datasets_cache = []
         
@@ -79,7 +85,9 @@ class PapersWithCodeOfflineLoader:
         """Load methods from JSON file"""
         if self._methods_cache is None:
             logger.info("📖 Loading methods dataset...")
-            self._methods_cache = self.downloader.load_json_file('methods', limit)
+            # Convert 0 to None (no limit) for the downloader
+            actual_limit = None if limit == 0 else limit
+            self._methods_cache = self.downloader.load_json_file('methods', actual_limit)
             if self._methods_cache is None:
                 self._methods_cache = []
         
@@ -89,7 +97,9 @@ class PapersWithCodeOfflineLoader:
         """Load evaluation tables from JSON file"""
         if self._evaluations_cache is None:
             logger.info("📖 Loading evaluation tables dataset...")
-            self._evaluations_cache = self.downloader.load_json_file('evaluations', limit)
+            # Convert 0 to None (no limit) for the downloader
+            actual_limit = None if limit == 0 else limit
+            self._evaluations_cache = self.downloader.load_json_file('evaluations', actual_limit)
             if self._evaluations_cache is None:
                 self._evaluations_cache = []
         
@@ -120,9 +130,15 @@ class PapersWithCodeOfflineLoader:
                 except:
                     pass
             
+            # Use arxiv_id as the primary identifier if available, otherwise fallback to other IDs
+            paper_id = (paper_data.get('arxiv_id') or 
+                       paper_data.get('id') or 
+                       paper_data.get('paper_id') or 
+                       str(hash(paper_data.get('title', ''))))
+            
             # Create paper object
             paper = Paper(
-                id=str(paper_data.get('id', paper_data.get('paper_id', ''))),
+                id=str(paper_id),
                 arxiv_id=paper_data.get('arxiv_id'),
                 url_abs=paper_data.get('url_abs') or paper_data.get('url'),
                 title=paper_data.get('title', ''),
@@ -213,12 +229,26 @@ class PapersWithCodeOfflineLoader:
         
         for link in links_data:
             try:
-                paper_id = str(link.get('paper_id', ''))
+                # Try different possible paper ID fields
+                paper_id = str(link.get('paper_id', '') or 
+                              link.get('paper_arxiv_id', '') or 
+                              link.get('arxiv_id', ''))
+                
                 if not paper_id:
+                    # Skip if no paper identifier found
                     continue
                 
                 # Parse repository from link data
-                repo = self.parse_repository(link)
+                repo_data = {
+                    'url': link.get('repo_url'),
+                    'framework': link.get('framework'),
+                    'description': None,
+                    'stars': 0,
+                    'language': None,
+                    'license': None
+                }
+                
+                repo = self.parse_repository(repo_data)
                 if repo:
                     if paper_id not in mapping:
                         mapping[paper_id] = []
@@ -240,8 +270,11 @@ class PapersWithCodeOfflineLoader:
         
         papers = []
         
+        # Convert 0 to None (no limit) for consistent handling
+        actual_limit = None if paper_limit == 0 else paper_limit
+        
         # Load papers data
-        papers_data = self.load_papers(paper_limit)
+        papers_data = self.load_papers(actual_limit)
         if not papers_data:
             logger.error("No papers data loaded")
             return []
@@ -269,8 +302,11 @@ class PapersWithCodeOfflineLoader:
         """Build Dataset objects from offline data"""
         logger.info("🗄️ Building datasets from offline data...")
         
+        # Convert 0 to None (no limit) for consistent handling
+        actual_limit = None if limit == 0 else limit
+        
         datasets = []
-        datasets_data = self.load_datasets_json(limit)
+        datasets_data = self.load_datasets_json(actual_limit)
         
         for dataset_data in datasets_data:
             dataset = self.parse_dataset(dataset_data)
@@ -285,10 +321,13 @@ class PapersWithCodeOfflineLoader:
         """Build Repository objects from links data"""
         logger.info("💾 Building repositories from offline data...")
         
+        # Convert 0 to None (no limit) for consistent handling
+        actual_limit = None if limit == 0 else limit
+        
         repositories = []
         seen_urls = set()
         
-        links_data = self.load_links(limit)
+        links_data = self.load_links(actual_limit)
         
         for link_data in links_data:
             repo = self.parse_repository(link_data)
@@ -302,15 +341,19 @@ class PapersWithCodeOfflineLoader:
     
     def load_and_save_to_neo4j(self, 
                                graph: PapersWithCodeGraph,
-                               paper_limit: Optional[int] = 100,
-                               dataset_limit: Optional[int] = 50,
+                               paper_limit: Optional[int] = 0,
+                               dataset_limit: Optional[int] = 0,
                                include_repositories: bool = True) -> Dict:
         """Load offline data and save to Neo4j knowledge graph"""
         logger.info("🚀 Starting offline data pipeline to Neo4j")
         
+        # Convert 0 to None (no limit) for consistent handling
+        actual_paper_limit = None if paper_limit == 0 else paper_limit
+        actual_dataset_limit = None if dataset_limit == 0 else dataset_limit
+        
         # Load datasets first
         logger.info("Phase 1: Loading datasets")
-        datasets = self.build_datasets(dataset_limit)
+        datasets = self.build_datasets(actual_dataset_limit)
         for dataset in datasets:
             if dataset.save_to_neo4j():
                 logger.debug(f"Saved dataset: {dataset.name}")
@@ -319,7 +362,7 @@ class PapersWithCodeOfflineLoader:
         
         # Load papers with repositories
         logger.info("Phase 2: Loading papers with code repositories")
-        papers = self.build_papers_with_code(paper_limit, include_repositories)
+        papers = self.build_papers_with_code(actual_paper_limit, include_repositories)
         
         for i, paper in enumerate(papers, 1):
             if paper.save_to_neo4j():
@@ -333,10 +376,13 @@ class PapersWithCodeOfflineLoader:
         logger.info(f"Statistics: {self.stats}")
         
         # Get Neo4j graph statistics
-        neo4j_stats = graph.get_graph_stats()
-        logger.info(f"Neo4j Graph Statistics: {neo4j_stats}")
-        
-        return {**self.stats, **neo4j_stats}
+        try:
+            neo4j_stats = graph.get_graph_stats()
+            logger.info(f"Neo4j Graph Statistics: {neo4j_stats}")
+            return {**self.stats, **neo4j_stats}
+        except Exception as e:
+            logger.error(f"Failed to get Neo4j stats: {e}")
+            return self.stats
     
     def get_data_summary(self) -> Dict:
         """Get summary of available offline data"""
@@ -362,11 +408,61 @@ class PapersWithCodeOfflineLoader:
 
 def main():
     """Main function to run offline data loading pipeline"""
-    import sys
+    import argparse
     
-    # Check for data directory argument
-    if len(sys.argv) > 1:
-        data_dir = sys.argv[1]
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Load Papers with Code offline data into Neo4j knowledge graph"
+    )
+    parser.add_argument(
+        "data_dir", 
+        nargs="?",
+        help="Path to PWC data directory (optional - will auto-detect most recent if not provided)"
+    )
+    parser.add_argument(
+        "--neo4j-uri", 
+        default="bolt://localhost:7687",
+        help="Neo4j database URI (default: bolt://localhost:7687)"
+    )
+    parser.add_argument(
+        "--neo4j-user", 
+        default="neo4j",
+        help="Neo4j username (default: neo4j)"
+    )
+    parser.add_argument(
+        "--neo4j-password", 
+        default="password",
+        help="Neo4j password (default: password)"
+    )
+    parser.add_argument(
+        "--paper-limit", 
+        type=int, 
+        default=0,
+        help="Maximum number of papers to load (default: 0 = no limit)"
+    )
+    parser.add_argument(
+        "--dataset-limit", 
+        type=int, 
+        default=0,
+        help="Maximum number of datasets to load (default: 0 = no limit)"
+    )
+    parser.add_argument(
+        "--include-repositories", 
+        action="store_true", 
+        default=True,
+        help="Include repository links (default: True)"
+    )
+    parser.add_argument(
+        "--no-repositories", 
+        action="store_true",
+        help="Exclude repository links"
+    )
+    
+    args = parser.parse_args()
+    
+    # Determine data directory
+    if args.data_dir:
+        data_dir = args.data_dir
     else:
         # Look for most recent download directory
         base_dir = Path(".")
@@ -376,7 +472,11 @@ def main():
             logger.info(f"Using most recent data directory: {data_dir}")
         else:
             logger.error("No PWC data directory found. Run pwc_dataset_downloader.py first.")
+            logger.info("Usage: python pwc_offline_loader.py [data_dir] [options]")
             return
+    
+    # Handle repository inclusion flag
+    include_repositories = args.include_repositories and not args.no_repositories
     
     try:
         # Initialize offline loader
@@ -389,21 +489,33 @@ def main():
             status = "✅" if available else "❌"
             logger.info(f"   {status} {dataset_key}")
         
-        # Neo4j configuration
-        NEO4J_URI = "bolt://localhost:7687"
-        NEO4J_USERNAME = "neo4j"
-        NEO4J_PASSWORD = "password"  # Change this
-        
         # Initialize knowledge graph
         logger.info("Initializing Papers with Code Knowledge Graph")
-        graph = PapersWithCodeGraph(NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD)
+        logger.info(f"Neo4j URI: {args.neo4j_uri}")
+        logger.info(f"Neo4j User: {args.neo4j_user}")
         
-        # Load data with limits (adjust as needed)
+        try:
+            graph = PapersWithCodeGraph(args.neo4j_uri, args.neo4j_user, args.neo4j_password)
+            # Test connection
+            graph.get_graph_stats()
+            logger.info("✅ Neo4j connection successful")
+        except Exception as e:
+            logger.error(f"❌ Neo4j connection failed: {e}")
+            logger.info("💡 Troubleshooting tips:")
+            logger.info("   1. Make sure Neo4j is running (check http://localhost:7474)")
+            logger.info("   2. Verify your password with: python test_neo4j_connection.py")
+            logger.info("   3. For Docker: docker run -p 7474:7474 -p 7687:7687 neo4j:latest")
+            logger.info("   4. Use --neo4j-password YOUR_ACTUAL_PASSWORD")
+            return
+        
+        # Load data with specified limits
+        logger.info(f"Loading with limits - Papers: {args.paper_limit}, Datasets: {args.dataset_limit}, Include Repos: {include_repositories}")
+        
         stats = loader.load_and_save_to_neo4j(
             graph=graph,
-            paper_limit=50,    # Start small for testing
-            dataset_limit=30,
-            include_repositories=True
+            paper_limit=args.paper_limit,
+            dataset_limit=args.dataset_limit,
+            include_repositories=include_repositories
         )
         
         logger.info("Pipeline completed successfully!")

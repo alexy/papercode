@@ -328,26 +328,74 @@ class PapersWithCodeLoader:
 
 def main():
     """Main function to run the data loading pipeline"""
-    # Neo4j configuration
-    NEO4J_URI = "bolt://localhost:7687"
-    NEO4J_USERNAME = "neo4j"
-    NEO4J_PASSWORD = "password"  # Change this to your Neo4j password
+    import argparse
+    
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Load Papers with Code data via API into Neo4j knowledge graph"
+    )
+    parser.add_argument(
+        "--neo4j-uri", 
+        default="bolt://localhost:7687",
+        help="Neo4j database URI (default: bolt://localhost:7687)"
+    )
+    parser.add_argument(
+        "--neo4j-user", 
+        default="neo4j",
+        help="Neo4j username (default: neo4j)"
+    )
+    parser.add_argument(
+        "--neo4j-password", 
+        default="password",
+        help="Neo4j password (default: password)"
+    )
+    parser.add_argument(
+        "--paper-limit", 
+        type=int, 
+        default=20,
+        help="Maximum number of papers to load (default: 20)"
+    )
+    parser.add_argument(
+        "--repo-limit", 
+        type=int, 
+        default=50,
+        help="Maximum number of repositories to load (default: 50)"
+    )
+    parser.add_argument(
+        "--dataset-limit", 
+        type=int, 
+        default=30,
+        help="Maximum number of datasets to load (default: 30)"
+    )
+    parser.add_argument(
+        "--task-limit", 
+        type=int, 
+        default=30,
+        help="Maximum number of tasks to load (default: 30)"
+    )
+    
+    args = parser.parse_args()
     
     try:
         # Initialize knowledge graph
         logger.info("Initializing Papers with Code Knowledge Graph")
-        graph = PapersWithCodeGraph(NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD)
+        logger.info(f"Neo4j URI: {args.neo4j_uri}")
+        logger.info(f"Neo4j User: {args.neo4j_user}")
+        
+        graph = PapersWithCodeGraph(args.neo4j_uri, args.neo4j_user, args.neo4j_password)
         
         # Initialize loader
         loader = PapersWithCodeLoader()
         
-        # Load data with limits (adjust as needed)
+        # Load data with specified limits
+        logger.info(f"Loading with limits - Papers: {args.paper_limit}, Repos: {args.repo_limit}, Datasets: {args.dataset_limit}, Tasks: {args.task_limit}")
+        
         stats = loader.load_and_save_to_neo4j(
             graph=graph,
-            paper_limit=20,    # Start small for testing
-            repo_limit=50,
-            dataset_limit=30,
-            task_limit=30
+            paper_limit=args.paper_limit,
+            repo_limit=args.repo_limit,
+            dataset_limit=args.dataset_limit,
+            task_limit=args.task_limit
         )
         
         logger.info("Pipeline completed successfully!")

@@ -305,13 +305,82 @@ class PapersWithCodeDatasetDownloader:
 
 def main():
     """Main function to download Papers with Code datasets"""
-    downloader = PapersWithCodeDatasetDownloader()
+    import argparse
     
-    # Download all files
-    results = downloader.download_all(delay_seconds=2.0)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Download Papers with Code official JSON datasets"
+    )
+    parser.add_argument(
+        "--output-dir", 
+        default=".",
+        help="Output directory for downloads (default: current directory)"
+    )
+    parser.add_argument(
+        "--delay", 
+        type=float, 
+        default=2.0,
+        help="Delay between downloads in seconds (default: 2.0)"
+    )
+    parser.add_argument(
+        "--datasets", 
+        nargs="+",
+        choices=["papers", "links", "evaluations", "methods", "datasets"],
+        help="Specific datasets to download (default: all)"
+    )
+    parser.add_argument(
+        "--extract", 
+        action="store_true", 
+        default=True,
+        help="Extract downloaded files (default: True)"
+    )
+    parser.add_argument(
+        "--no-extract", 
+        action="store_true",
+        help="Skip extraction of downloaded files"
+    )
+    parser.add_argument(
+        "--cleanup", 
+        action="store_true",
+        help="Remove compressed files after extraction"
+    )
     
-    # Extract all files
-    extracted = downloader.extract_all()
+    args = parser.parse_args()
+    
+    # Initialize downloader
+    downloader = PapersWithCodeDatasetDownloader(args.output_dir)
+    
+    # Download files
+    if args.datasets:
+        # Download specific datasets
+        logger.info(f"Downloading specific datasets: {args.datasets}")
+        results = {}
+        for dataset_key in args.datasets:
+            if dataset_key in downloader.DATASETS:
+                results[dataset_key] = downloader.download_file(dataset_key)
+                if args.delay > 0 and dataset_key != args.datasets[-1]:
+                    logger.info(f"⏳ Waiting {args.delay} seconds...")
+                    time.sleep(args.delay)
+            else:
+                logger.error(f"Unknown dataset: {dataset_key}")
+    else:
+        # Download all files
+        results = downloader.download_all(delay_seconds=args.delay)
+    
+    # Extract files if requested
+    extract_files = args.extract and not args.no_extract
+    if extract_files:
+        if args.datasets:
+            extracted = {}
+            for dataset_key in args.datasets:
+                if results.get(dataset_key):
+                    extracted[dataset_key] = downloader.extract_file(dataset_key)
+        else:
+            extracted = downloader.extract_all()
+    
+    # Cleanup compressed files if requested
+    if args.cleanup and extract_files:
+        downloader.cleanup_compressed_files()
     
     # Show download info
     info = downloader.get_download_info()
@@ -320,13 +389,13 @@ def main():
     logger.info(f"   Total size: {info['total_size_mb']} MB")
     
     for dataset_key, file_info in info['files'].items():
-        status = "✅" if file_info['extracted_exists'] else "❌"
-        logger.info(f"   {status} {file_info['description']}: {file_info['extracted_size_mb']} MB")
-    
-    # Optional: cleanup compressed files to save space
-    # downloader.cleanup_compressed_files()
+        if not args.datasets or dataset_key in args.datasets:
+            status = "✅" if file_info['extracted_exists'] else "❌"
+            logger.info(f"   {status} {file_info['description']}: {file_info['extracted_size_mb']} MB")
     
     logger.info(f"\n🎯 Use the downloaded data with:")
+    logger.info(f"   python pwc_offline_loader.py {downloader.download_dir}")
+    logger.info(f"   # Or in Python:")
     logger.info(f"   from pwc_offline_loader import PapersWithCodeOfflineLoader")
     logger.info(f"   loader = PapersWithCodeOfflineLoader('{downloader.download_dir}')")
 

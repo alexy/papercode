@@ -150,8 +150,12 @@ loaded_paper = Paper.load_from_neo4j("unique_paper_id")
 ### Running the Data Pipeline
 
 ```bash
-# Load data from Papers with Code API into Neo4j
-python pwc_loader.py
+# Online API Pipeline
+python pwc_loader.py --neo4j-uri bolt://localhost:7687 --neo4j-user neo4j --neo4j-password mypassword
+
+# Offline Data Pipeline
+python pwc_dataset_downloader.py --datasets papers links --output-dir /path/to/data
+python pwc_offline_loader.py /path/to/data/pwc-20250610 --neo4j-password mypassword
 
 # Run tests
 python test_pipeline.py
