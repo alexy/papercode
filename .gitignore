@@ -4,3 +4,4 @@
 venv
 pwc-20*
 config.yaml
+.DS_Store
